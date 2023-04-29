@@ -24,4 +24,4 @@ class GenerateReportMessageRequest:
     employer: str
     employee_language: str
     employer_language: str
-    chatMessages: list[EmployeeMessage]
+    chat_messages: list[EmployeeMessage]
