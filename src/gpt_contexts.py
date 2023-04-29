@@ -15,4 +15,7 @@ TRANSLATED_KEYPOINTS = 'You are a technician working at a company and have writt
                        'The key points are written in {} and you should translate the list to {}. Only output the translated list, do not take any contents from the original language'\
                        'Here are the key points: '
 
-TRANSLATED_REPORT = 'You are a technician working at a company and have elaborated a report for your boss. However, your boss only speaks {} and you have to translate it. Here is the report: '
+TRANSLATED_REPORT = 'You are a technician working at a company and have elaborated a report for your boss. ' \
+                    'However, your boss only speaks {} and you have to translate it. Here is the report: '
+
+RE_TRANSLATE_REPORT = "Can you translate this text from {} to {}?"

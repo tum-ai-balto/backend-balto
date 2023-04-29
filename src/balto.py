@@ -1,25 +1,43 @@
 import openai
 import json
-import os, sys, time, re
+import os, sys, time, re, base64
 import pika
 import gpt_contexts
 import pdfkit
+import score
 
 from langcodes import Language
 from message import GenerateReportMessageRequest, EmployeeMessage
 
-RABBIT_MQ = 'localhost'
+# 10789
+
+RABBIT_MQ = 'ssh.grassi.dev'
 INCOMING_MSG_QUEUE = 'incoming-msgs'
 OUTGOING_MSG_QUEUE = 'outgoing-msgs'
+TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
+
+
+def score_to_color(accuracy: float) -> str:
+    if accuracy <= 0.1:
+        return "#ff0000"
+    elif accuracy <= 0.3:
+        return "#ff4c4c"
+    elif accuracy <= 0.5:
+        return "#ffd424"
+    elif accuracy <= 0.7:
+        return "#ddff24"
+    else:
+        return "#56ff24"
 
 
 def language_tag_to_name(tag: str) -> str:
     return Language.make(tag).display_name()
 
 
-def audio_to_text():
-    text = ""
-    with open("audio.mp3", "rb") as audio_file:
+def audio_to_text(audio_url: str) -> str:
+    # telegram_endpoint = f"https://api.telegram.org/bot{audio_url}"
+
+    with open("../audio/sample.mp3", "rb") as audio_file:
         text = openai.Audio.transcribe("whisper-1", audio_file)
 
     return text['text']
@@ -36,10 +54,10 @@ def extract_report_from_msg(messages: GenerateReportMessageRequest) -> str:
 
     for msg in messages.chat_messages:
         if msg.kind == EmployeeMessage.Kind.AUDIO:
-            # Download the audio from msg.content
-            pass
+            text += audio_to_text(msg.content)
         elif msg.kind == EmployeeMessage.Kind.TEXT:
             text += msg.content
+        text += "\n"
 
     return text
 
@@ -69,9 +87,11 @@ def generate_pdf_report(content):
         'margin-bottom': '0.75in',
         'margin-left': '0.75in',
     }
-
-    bullet_points = filter(lambda l: re.match("[0-9]+", l), content['translated_keypoints'].split("\n"))
+    bullet_points = filter(lambda l: re.match("[0-9]+", l), content['keypoints'].split("\n"))
     bullet_points = ''.join(map(lambda l: f"<li>{re.split('[0-9]+. +', l)[1]}</li>", bullet_points))
+    translated_bullet_points = filter(lambda l: re.match("[0-9]+", l), content['translated_keypoints'].split("\n"))
+    translated_bullet_points = ''.join(
+        map(lambda l: f"<li>{re.split('[0-9]+. +', l)[1]}</li>", translated_bullet_points))
 
     images = list(map(lambda i: f"<img width='300' src='{i}' />", content['images']))
 
@@ -79,18 +99,28 @@ def generate_pdf_report(content):
     translated_content += f"<h1>Company Name</h1>" \
                           f"<h2>{content['employee']}</h2>"
     translated_content += f"<h3>{content['translated_title']}</h3>"
+    translated_content += f"<p><b>Score</b>: {content['accuracy']}</p>"
     translated_content += f"<p><b>Report:</b><br>{content['translated_report']}</p>"
+    translated_content += f"<p><b>Key points:</b><br><ol>{translated_bullet_points}</ol></p>"
+    translated_content += f"<h3>{content['title']}</h3>"
+    translated_content += f"<p><b>Score</b>: {content['accuracy']}</p>"
+    translated_content += f"<p><b>Report:</b><br>{content['report']}</p>"
     translated_content += f"<p><b>Key points:</b><br><ol>{bullet_points}</ol></p>"
-    translated_content += f"<div><h4>Media</h4>{''.join(images)}</div>"
+
+    if len(images) > 0:
+        translated_content += f"<div><h4>Media</h4>{''.join(images)}</div>"
 
     translated_content += "</body></html>"
 
-    pdfkit.from_string(translated_content, f"../pdfs/pdf-{time.time_ns()}.pdf", options=pdf_options)
+    pdf_path = f"../pdfs/pdf-{time.time_ns()}.pdf"
+    pdfkit.from_string(translated_content, pdf_path, options=pdf_options)
 
-    return
+    return pdf_path
 
 
 def on_incoming_msg(_channel, _method, _properties, body) -> None:
+    print("[info] :: incoming message...")
+
     incoming_msg = GenerateReportMessageRequest.from_json(body)
     images = list(
         map(lambda x: x.content, filter(lambda x: x.kind == EmployeeMessage.Kind.IMAGE, incoming_msg.chat_messages)))
@@ -101,7 +131,11 @@ def on_incoming_msg(_channel, _method, _properties, body) -> None:
         f"[info] :: employee '{incoming_msg.employee}' ({employee_lang}) is sending a message to the employer '{incoming_msg.employer}' ({employer_lang})...")
 
     report = extract_report_from_msg(incoming_msg)
-    gpt_prompt = build_gpt_prompt(gpt_contexts.TITLE.format(employee_lang), report)
+
+    gpt_prompt = build_gpt_prompt(gpt_contexts.RE_TRANSLATE_REPORT.format('english', employee_lang), gpt_contexts.TITLE)
+    translated_prompt = ask_gpt(gpt_prompt)
+
+    gpt_prompt = build_gpt_prompt(translated_prompt, report)
     generated_title = ask_gpt(gpt_prompt)
     print(f"[info] :: generated title from text: '{generated_title}'")
 
@@ -118,6 +152,12 @@ def on_incoming_msg(_channel, _method, _properties, body) -> None:
     gpt_prompt = build_gpt_prompt(gpt_contexts.TRANSLATED_REPORT.format(employer_lang), report)
     translated_report = ask_gpt(gpt_prompt)
 
+    gpt_prompt = build_gpt_prompt(gpt_contexts.RE_TRANSLATE_REPORT.format(employer_lang, employee_lang),
+                                  translated_report)
+    re_translated_report = ask_gpt(gpt_prompt)
+
+    scores, accuracy = score.calculate_fidelity(report, re_translated_report)
+    print(f"[info] :: accuracy computed = {accuracy}, scores = {scores}")
     print(f"[info] :: generation complete. Dumping the message content on the filesystem...")
 
     created_content = {
@@ -129,18 +169,23 @@ def on_incoming_msg(_channel, _method, _properties, body) -> None:
         'translated_title': translated_title,
         'translated_report': translated_report,
         'translated_keypoints': translated_keypoints,
-        'images': images
+        'images': images,
+        'accuracy': str(accuracy)
     }
 
     # Store the message for analysis
     dump_incoming_message(created_content)
 
     # Generate PDF file
-    generate_pdf_report(created_content)
+    pdf_path = generate_pdf_report(created_content)
+    with open(pdf_path, 'rb') as pdf:
+        created_content['pdf'] = base64.b64encode(pdf.read()).decode('ascii')
+
+    _channel.basic_publish(exchange='', routing_key=OUTGOING_MSG_QUEUE, body=json.dumps(created_content))
 
 
 def main():
-    print("[info] :: connecting to RabbitMQ for receiving messages...")
+    print("[info] :: connecting to RabbitMQ for handling messages...")
 
     connection = pika.BlockingConnection(pika.ConnectionParameters(RABBIT_MQ))
     channel = connection.channel()
@@ -151,6 +196,7 @@ def main():
 
     channel.basic_consume(queue=INCOMING_MSG_QUEUE, auto_ack=True, on_message_callback=on_incoming_msg)
 
+    print("[info] :: start main message loop...")
     channel.start_consuming()
 
 
@@ -159,15 +205,6 @@ if __name__ == "__main__":
     # Set up OpenAI key
     openai.api_key = os.getenv('OPENAI_KEY')
     try:
-        # main()
-        test_msg = GenerateReportMessageRequest('John Doe', 'Maria Garcia', 'en', 'es', [
-            EmployeeMessage(EmployeeMessage.Kind.TEXT,
-                            "I met with the customer, Mr. Dennis Huff, who is the maintenance supervisor, to conduct an entrance interview. He told me that the machine had been down for about an hour so I could inspect some items before it resumed production of B / E double wall. I checked the lower corrugating roll and found its number W-76702, but the other roll had a lot of build up that obscured its number. I took NCR's to measure the parallelism of the corrugating rolls. The lineal counter showed 66,781,034 million lineal feet. I also looked at the roll condition briefly. I talked to the maintenance department about what they had done in the last two weeks to fix some issues with the machine. They said they had to adjust the corrugating roll parallel several times and that the roll slot wear was misaligned at ambient temperature. I checked the alignment of the corrugating rolls at heated condition and found a clear misalignment. The wear pattern on the lower corrugating roll was shifted by about two millimeters. I arranged for the machine to be cooled off for the weekly PM maintenance. I examined the corrugating rolls and saw significant plating loss on the tips and root radius of the rolls. The NCR's showed larger impressions than expected for the lineal footage on the counters. There was also a noticeable average paper width wear pattern on the rolls. When I applied 90 bar to the rolls, I saw that there was no engagement on both sides of the width for about 10 inches, centered 18 inches from the ends of the rolls. The shifting of the corrugating rolls was evident in the NCR's marks. The second resonance samples showed malformed flutes."),
-            EmployeeMessage(EmployeeMessage.Kind.IMAGE,
-                            "https://png.pngtree.com/png-clipart/20220716/ourmid/pngtree-banana-yellow-fruit-banana-skewers-png-image_5944324.png"),
-            EmployeeMessage(EmployeeMessage.Kind.IMAGE,
-                            "https://banner2.cleanpng.com/20180524/tqg/kisspng-llama-alpaca-camel-drawing-5b073e5101e844.6911836915272013610078.jpg"),
-        ])
-        on_incoming_msg(None, None, None, test_msg.to_json())
+        main()
     except KeyboardInterrupt:
         sys.exit(0)
