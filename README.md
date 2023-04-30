@@ -1,4 +1,6 @@
-## Balto Backend
+## Backend
+In the backend, we used the OpenAI API to first summarize the report into bullet points, as it is easier for the employer to have a clear idea of what the employee did. Then, all the report text and bullet points are translated from the language of the employee to the language of the employer.
 
-This repository contains the code necessary to run the report generation and translation using `OpenAI` and `RabbitMQ`. The backend will
-receive a message from Telegram and it will extract all the necessary information to produce a report.
+After that, we perform some statistical analysis to check how accurate the translation was. The method we chose was back translating the report text to the original language and comparing the two texts. We use again the OpenAI API to create embeddings for every sentence in both of the texts. These embeddings are then paired to its nearest neighbor by performing KNN analysis. Once they are paired like that, we get rid of outliers. This is because the translators do not respect the punctuation marks, so sometimes a sentence like 'Hello boss' may be back translated as 'Hello, boss' and then split into 'Hello' and 'boss'. Having this sentence split would be decreasing the score, but actually the meaning of the original text has not been lost. Once we have the pairs, we used a deep learning model (BLEURT) to compare how close two sentence embeddings are and generate a score (0 to 1) for every pair. We get rid of non-representative data (the algorithm we used sometimes gives results below 0 or over 1), and after calculate the mean score for all sentences, obtaining a final value for the text accuracy.
+
+Once the score is calculated, the report is built in PDF, and then forwarded to the telegram chat of both the employee and the employer.
