@@ -52,7 +52,7 @@ def language_tag_to_name(tag: str) -> str:
 
 def audio_to_text(audio_url: str) -> str:
     # telegram_endpoint = f"https://api.telegram.org/bot{audio_url}"
-
+    # We should download the file
     with open("../audio/sample.mp3", "rb") as audio_file:
         text = openai.Audio.transcribe("whisper-1", audio_file)
 
