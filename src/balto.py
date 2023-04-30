@@ -1,28 +1,44 @@
-import openai
 import json
+import multiprocessing
 import os, sys, time, re, base64
+
 import pika
-import gpt_contexts
+import openai
 import pdfkit
+from jinja2 import Environment, FileSystemLoader
+
+
+# User-defined python module
 import score
+import gpt_contexts
 
 from langcodes import Language
 from message import GenerateReportMessageRequest, EmployeeMessage
-
-# 10789
+from fluent.runtime import FluentLocalization, FluentResourceLoader
 
 RABBIT_MQ = 'ssh.grassi.dev'
 INCOMING_MSG_QUEUE = 'incoming-msgs'
 OUTGOING_MSG_QUEUE = 'outgoing-msgs'
 TELEGRAM_BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+loader = FluentResourceLoader("../locale/{locale}")
+jinja_env = Environment(loader=FileSystemLoader("../templates/"))
+
+def score_to_human_readable(accuracy: float) -> str:
+    if accuracy <= 0.2:
+        return "insufficient"
+    elif accuracy <= 0.4:
+        return "sufficient"
+    elif accuracy <= 0.7:
+        return "good"
+    else:
+        return "excellent"
+
 
 def score_to_color(accuracy: float) -> str:
-    if accuracy <= 0.1:
+    if accuracy <= 0.2:
         return "#ff0000"
-    elif accuracy <= 0.3:
-        return "#ff4c4c"
-    elif accuracy <= 0.5:
+    elif accuracy <= 0.40:
         return "#ffd424"
     elif accuracy <= 0.7:
         return "#ddff24"
@@ -79,7 +95,7 @@ def dump_incoming_message(content):
     print(f"[info] :: write report to file '{final_path}'")
 
 
-def generate_pdf_report(content):
+def generate_pdf_report(content, locale_manager):
     pdf_options = {
         'page-size': 'A4',
         'margin-top': '0.75in',
@@ -87,33 +103,26 @@ def generate_pdf_report(content):
         'margin-bottom': '0.75in',
         'margin-left': '0.75in',
     }
-    bullet_points = filter(lambda l: re.match("[0-9]+", l), content['keypoints'].split("\n"))
-    bullet_points = ''.join(map(lambda l: f"<li>{re.split('[0-9]+. +', l)[1]}</li>", bullet_points))
-    translated_bullet_points = filter(lambda l: re.match("[0-9]+", l), content['translated_keypoints'].split("\n"))
-    translated_bullet_points = ''.join(
-        map(lambda l: f"<li>{re.split('[0-9]+. +', l)[1]}</li>", translated_bullet_points))
 
-    images = list(map(lambda i: f"<img width='300' src='{i}' />", content['images']))
 
-    translated_content = "<html><head><meta charset='utf-8'><style>* { font-family: 'system-ui', sans-serif; text-align: justify; }</style></head><body>"
-    translated_content += f"<h1>Company Name</h1>" \
-                          f"<h2>{content['employee']}</h2>"
-    translated_content += f"<h3>{content['translated_title']}</h3>"
-    translated_content += f"<p><b>Score</b>: {content['accuracy']}</p>"
-    translated_content += f"<p><b>Report:</b><br>{content['translated_report']}</p>"
-    translated_content += f"<p><b>Key points:</b><br><ol>{translated_bullet_points}</ol></p>"
-    translated_content += f"<h3>{content['title']}</h3>"
-    translated_content += f"<p><b>Score</b>: {content['accuracy']}</p>"
-    translated_content += f"<p><b>Report:</b><br>{content['report']}</p>"
-    translated_content += f"<p><b>Key points:</b><br><ol>{bullet_points}</ol></p>"
+    bullet_points = filter(lambda l: re.match("[0-9]+", l), content['translated_keypoints'].split("\n"))
+    bullet_points = map(lambda l: re.split('[0-9]+. +', l)[1], bullet_points)
+    accuracy = score_to_human_readable(float(content['accuracy']))
 
-    if len(images) > 0:
-        translated_content += f"<div><h4>Media</h4>{''.join(images)}</div>"
-
-    translated_content += "</body></html>"
+    template = jinja_env.get_template("report.html")
+    rendered_template = template.render(
+        locale_manager=locale_manager,
+        translated_report = content['translated_report'],
+        translated_title = content['translated_title'],
+        translated_bullet_points = bullet_points,
+        employee = content['employee'],
+        images = content['images'],
+        score = locale_manager.format_value(accuracy),
+        score_desc = locale_manager.format_value(f"{accuracy}-description")
+    )
 
     pdf_path = f"../pdfs/pdf-{time.time_ns()}.pdf"
-    pdfkit.from_string(translated_content, pdf_path, options=pdf_options)
+    pdfkit.from_string(rendered_template, pdf_path, options=pdf_options)
 
     return pdf_path
 
@@ -127,6 +136,9 @@ def on_incoming_msg(_channel, _method, _properties, body) -> None:
 
     employer_lang = language_tag_to_name(incoming_msg.employer_language)
     employee_lang = language_tag_to_name(incoming_msg.employee_language)
+
+    locale_manager = FluentLocalization([incoming_msg.employer_language], ["main.ftl"], loader)
+
     print(
         f"[info] :: employee '{incoming_msg.employee}' ({employee_lang}) is sending a message to the employer '{incoming_msg.employer}' ({employer_lang})...")
 
@@ -146,9 +158,9 @@ def on_incoming_msg(_channel, _method, _properties, body) -> None:
     translated_title = ask_gpt(gpt_prompt)
     print(f"[info] :: translated title: '{generated_title}' -> '{translated_title}'")
 
-    gpt_prompt = build_gpt_prompt(gpt_contexts.TRANSLATED_KEYPOINTS.format(employer_lang, employer_lang),
-                                  generated_keypoints)
+    gpt_prompt = build_gpt_prompt(gpt_contexts.TRANSLATED_KEYPOINTS.format(employer_lang, employer_lang), generated_keypoints)
     translated_keypoints = ask_gpt(gpt_prompt)
+
     gpt_prompt = build_gpt_prompt(gpt_contexts.TRANSLATED_REPORT.format(employer_lang), report)
     translated_report = ask_gpt(gpt_prompt)
 
@@ -177,15 +189,17 @@ def on_incoming_msg(_channel, _method, _properties, body) -> None:
     dump_incoming_message(created_content)
 
     # Generate PDF file
-    pdf_path = generate_pdf_report(created_content)
+    pdf_path = generate_pdf_report(created_content, locale_manager)
     with open(pdf_path, 'rb') as pdf:
         created_content['pdf'] = base64.b64encode(pdf.read()).decode('ascii')
+
+    print("[info] :: sending the generated report to the bot")
 
     _channel.basic_publish(exchange='', routing_key=OUTGOING_MSG_QUEUE, body=json.dumps(created_content))
 
 
-def main():
-    print("[info] :: connecting to RabbitMQ for handling messages...")
+def main_loop():
+    print(f"[info] :: connecting to RabbitMQ for handling messages...")
 
     connection = pika.BlockingConnection(pika.ConnectionParameters(RABBIT_MQ))
     channel = connection.channel()
@@ -196,7 +210,7 @@ def main():
 
     channel.basic_consume(queue=INCOMING_MSG_QUEUE, auto_ack=True, on_message_callback=on_incoming_msg)
 
-    print("[info] :: start main message loop...")
+    print(f"[info] :: start main message loop...")
     channel.start_consuming()
 
 
@@ -205,6 +219,6 @@ if __name__ == "__main__":
     # Set up OpenAI key
     openai.api_key = os.getenv('OPENAI_KEY')
     try:
-        main()
+        main_loop()
     except KeyboardInterrupt:
         sys.exit(0)

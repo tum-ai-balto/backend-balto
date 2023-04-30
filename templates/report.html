@@ -1,0 +1,44 @@
+<!doctype html>
+<html>
+<head>
+    <meta charset="utf-8"/>
+    <style>
+        * {
+            font-family: 'system-ui', sans-serif;
+            text-align: justify;
+        }
+    </style>
+</head>
+<body>
+<h1>Company's Name Placeholder</h1>
+<h2>{{ employee }}</h2>
+<div class="translated">
+    <h3>{{ translated_title }}</h3>
+    <p>
+        <b>{{ locale_manager.format_value("score") }}</b>
+        <br>
+        {{ score }}: {{score_desc}}
+    </p>
+    <p>
+        <b>{{ locale_manager.format_value("report") }}</b>
+        <br>
+        {{ translated_report }}
+    </p>
+    <p>
+        <b>{{ locale_manager.format_value("key-points") }}</b>
+        <br>
+    <ol>
+        {% for point in translated_bullet_points %}
+        <li>{{ point }}</li>
+        {% endfor %}
+    </ol>
+    </p>
+</div>
+
+<div class="media">
+    {% for im in images %}
+    <img src="{{ im }}" width="300">
+    {% endfor %}
+</div>
+</body>
+</html>
